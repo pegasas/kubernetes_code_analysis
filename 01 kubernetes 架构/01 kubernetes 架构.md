@@ -4,7 +4,7 @@
 
 Kubernetes 总架构图如图所示。
 
-![avatar](picture/kubernetes_structure.png)
+![avatar](../picture/kubernetes_structure.png)
 
 Kubernetes遵循客户端/服务端(C/S)架构，系统架构分为 Master 和 Node 两部分， Master 作为服务端， Node 作为客户端。Kubernetes 系统具有多个 Master 服务端，可以实现高可用 。在默认情况下， 一个 Master 服务端即可
 完成所有工作。
@@ -36,15 +36,15 @@ Node 节点主要包含如下组件：
 
 ### kubectl
 
-官方提供的cli工具，用户可以用命令的方式交互k8s api server进行操作 通信协议json http，kubectl发送相应的http请求，由api server接受处理并且反馈给kubectl 然后展示结果，至此一次请求周期结束
+kubectl 是 Kubernetes 官方提供的命令行工具（CLI）， 用户可以通过 kubectl 以命令行交互的方式对 Kubernetes API Server 进行操作。kubectl 发送相应的 HTTP 请求，请求由 Kubernetes API Server 接收、处理并将结果反馈给 kubectl 。 kubectl 收到响应并展示结果。至此， kubectl 与 kube-apiserver 一次请求周期结束。
 
 ### client-go
 
-k8s提供了编程式的与k8s api server通信 client-go是从k8s代码中单独抽离出来的包，并作为官方提供的go语言的客户端发挥作用，client-go简单 以用，k8s系统二其他组件与api通信也是基于client-go实现
+client-go 提供了通过编程的方式让 Kubernetes 核心组件（kube-scheduler,kube-controller-manager等）与 Kubernetes API Server 进行通信。client-go 在 Kubernetes 系统上做了大量优化，
 
 ### kube-apiserver
 
-它负责将k8s“资源组/资源版本/资源 以restful的风格的形式对外暴露并提供服务。k8s集群所有组件都通过apiserver操作资源对象，apiserver也是集群中唯一与etcd集群进行交互的核心组件
+kube-apiserver（Kubernetes API Server）负责将 Kubernetes “资源组/资源版本/资源”以restful的风格的形式对外暴露并提供服务。k8s集群所有组件都通过 kube-apiserver 操作资源对象，apiserver也是集群中唯一与etcd集群进行交互的核心组件
 etcd分布式键值存储集群，提供了可靠强一致性的服务发现。etcd村粗集群的状态和元数据，其中包括
 k8s资源对象信息 集群节点等k8s所有数据村粗在前缀为/registry的目录下
 api属于核心组件 至关重要，有以下特性
