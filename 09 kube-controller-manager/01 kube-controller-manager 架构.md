@@ -6,7 +6,7 @@ Controller Manager 由 kube-controller-manager 和 cloud-controller-manager 组�
 
 kube-controller-manager 由一系列的控制器组成
 
-- Replication Controller
+- Replication Controller && RelicaSet
 - Node Controller
 - CronJob Controller
 - Daemon Controller
@@ -16,7 +16,6 @@ kube-controller-manager 由一系列的控制器组成
 - Namespace Controller
 - Job Controller
 - Pod AutoScaler
-- RelicaSet
 - Service Controller
 - ServiceAccount Controller
 - StatefulSet Controller
