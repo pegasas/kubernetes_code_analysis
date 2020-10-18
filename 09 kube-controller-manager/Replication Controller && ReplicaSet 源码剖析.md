@@ -139,7 +139,7 @@ func NewBaseController(rsInformer appsinformers.ReplicaSetInformer, podInformer 
 }
 ```
 
-replicaSetController 初始化完成后会调用 Run 方法启动 5 个 goroutine 处理 informer 队列中的事件并进行 sync 操作，kube-controller-manager 中每个 controller 的启动操作都是如下所示流程。
+replicaSetController 初始化完成后会调用 Run 方法启动多个 goroutine 处理 informer 队列中的事件并进行 sync 操作，kube-controller-manager 中每个 controller 的启动操作都是如下所示流程。
 
 ```
 // Run begins watching and syncing.
@@ -188,6 +188,380 @@ func (rsc *ReplicaSetController) processNextWorkItem() bool {
 	return true
 }
 ```
+
+### EventHandler
+
+初始化 replicaSetController 时所注册的 eventHandler，replicaSetController 会 watch pod 和 replicaSet 两个对象，eventHandler 中注册了对这两种对象的 add、update、delete 三个操作。
+
+addPod/updatePod/deletePod
+
+```
+// When a pod is created, enqueue the replica set that manages it and update its expectations.
+func (rsc *ReplicaSetController) addPod(obj interface{}) {
+	pod := obj.(*v1.Pod)
+
+	if pod.DeletionTimestamp != nil {
+		// on a restart of the controller manager, it's possible a new pod shows up in a state that
+		// is already pending deletion. Prevent the pod from being a creation observation.
+		rsc.deletePod(pod)
+		return
+	}
+
+	// If it has a ControllerRef, that's all that matters.
+	if controllerRef := metav1.GetControllerOf(pod); controllerRef != nil {
+		rs := rsc.resolveControllerRef(pod.Namespace, controllerRef)
+		if rs == nil {
+			return
+		}
+		rsKey, err := controller.KeyFunc(rs)
+		if err != nil {
+			return
+		}
+		klog.V(4).Infof("Pod %s created: %#v.", pod.Name, pod)
+		rsc.expectations.CreationObserved(rsKey)
+		rsc.queue.Add(rsKey)
+		return
+	}
+
+	// Otherwise, it's an orphan. Get a list of all matching ReplicaSets and sync
+	// them to see if anyone wants to adopt it.
+	// DO NOT observe creation because no controller should be waiting for an
+	// orphan.
+	rss := rsc.getPodReplicaSets(pod)
+	if len(rss) == 0 {
+		return
+	}
+	klog.V(4).Infof("Orphan Pod %s created: %#v.", pod.Name, pod)
+	for _, rs := range rss {
+		rsc.enqueueRS(rs)
+	}
+}
+```
+
+```
+// When a pod is updated, figure out what replica set/s manage it and wake them
+// up. If the labels of the pod have changed we need to awaken both the old
+// and new replica set. old and cur must be *v1.Pod types.
+func (rsc *ReplicaSetController) updatePod(old, cur interface{}) {
+	curPod := cur.(*v1.Pod)
+	oldPod := old.(*v1.Pod)
+	if curPod.ResourceVersion == oldPod.ResourceVersion {
+		// Periodic resync will send update events for all known pods.
+		// Two different versions of the same pod will always have different RVs.
+		return
+	}
+
+	labelChanged := !reflect.DeepEqual(curPod.Labels, oldPod.Labels)
+	if curPod.DeletionTimestamp != nil {
+		// when a pod is deleted gracefully it's deletion timestamp is first modified to reflect a grace period,
+		// and after such time has passed, the kubelet actually deletes it from the store. We receive an update
+		// for modification of the deletion timestamp and expect an rs to create more replicas asap, not wait
+		// until the kubelet actually deletes the pod. This is different from the Phase of a pod changing, because
+		// an rs never initiates a phase change, and so is never asleep waiting for the same.
+		rsc.deletePod(curPod)
+		if labelChanged {
+			// we don't need to check the oldPod.DeletionTimestamp because DeletionTimestamp cannot be unset.
+			rsc.deletePod(oldPod)
+		}
+		return
+	}
+
+	curControllerRef := metav1.GetControllerOf(curPod)
+	oldControllerRef := metav1.GetControllerOf(oldPod)
+	controllerRefChanged := !reflect.DeepEqual(curControllerRef, oldControllerRef)
+	if controllerRefChanged && oldControllerRef != nil {
+		// The ControllerRef was changed. Sync the old controller, if any.
+		if rs := rsc.resolveControllerRef(oldPod.Namespace, oldControllerRef); rs != nil {
+			rsc.enqueueRS(rs)
+		}
+	}
+
+	// If it has a ControllerRef, that's all that matters.
+	if curControllerRef != nil {
+		rs := rsc.resolveControllerRef(curPod.Namespace, curControllerRef)
+		if rs == nil {
+			return
+		}
+		klog.V(4).Infof("Pod %s updated, objectMeta %+v -> %+v.", curPod.Name, oldPod.ObjectMeta, curPod.ObjectMeta)
+		rsc.enqueueRS(rs)
+		// TODO: MinReadySeconds in the Pod will generate an Available condition to be added in
+		// the Pod status which in turn will trigger a requeue of the owning replica set thus
+		// having its status updated with the newly available replica. For now, we can fake the
+		// update by resyncing the controller MinReadySeconds after the it is requeued because
+		// a Pod transitioned to Ready.
+		// Note that this still suffers from #29229, we are just moving the problem one level
+		// "closer" to kubelet (from the deployment to the replica set controller).
+		if !podutil.IsPodReady(oldPod) && podutil.IsPodReady(curPod) && rs.Spec.MinReadySeconds > 0 {
+			klog.V(2).Infof("%v %q will be enqueued after %ds for availability check", rsc.Kind, rs.Name, rs.Spec.MinReadySeconds)
+			// Add a second to avoid milliseconds skew in AddAfter.
+			// See https://github.com/kubernetes/kubernetes/issues/39785#issuecomment-279959133 for more info.
+			rsc.enqueueRSAfter(rs, (time.Duration(rs.Spec.MinReadySeconds)*time.Second)+time.Second)
+		}
+		return
+	}
+
+	// Otherwise, it's an orphan. If anything changed, sync matching controllers
+	// to see if anyone wants to adopt it now.
+	if labelChanged || controllerRefChanged {
+		rss := rsc.getPodReplicaSets(curPod)
+		if len(rss) == 0 {
+			return
+		}
+		klog.V(4).Infof("Orphan Pod %s updated, objectMeta %+v -> %+v.", curPod.Name, oldPod.ObjectMeta, curPod.ObjectMeta)
+		for _, rs := range rss {
+			rsc.enqueueRS(rs)
+		}
+	}
+}
+```
+
+```
+// When a pod is deleted, enqueue the replica set that manages the pod and update its expectations.
+// obj could be an *v1.Pod, or a DeletionFinalStateUnknown marker item.
+func (rsc *ReplicaSetController) deletePod(obj interface{}) {
+	pod, ok := obj.(*v1.Pod)
+
+	// When a delete is dropped, the relist will notice a pod in the store not
+	// in the list, leading to the insertion of a tombstone object which contains
+	// the deleted key/value. Note that this value might be stale. If the pod
+	// changed labels the new ReplicaSet will not be woken up till the periodic resync.
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %+v", obj))
+			return
+		}
+		pod, ok = tombstone.Obj.(*v1.Pod)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a pod %#v", obj))
+			return
+		}
+	}
+
+	controllerRef := metav1.GetControllerOf(pod)
+	if controllerRef == nil {
+		// No controller should care about orphans being deleted.
+		return
+	}
+	rs := rsc.resolveControllerRef(pod.Namespace, controllerRef)
+	if rs == nil {
+		return
+	}
+	rsKey, err := controller.KeyFunc(rs)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", rs, err))
+		return
+	}
+	klog.V(4).Infof("Pod %s/%s deleted through %v, timestamp %+v: %#v.", pod.Namespace, pod.Name, utilruntime.GetCaller(), pod.DeletionTimestamp, pod)
+	rsc.expectations.DeletionObserved(rsKey, controller.PodKey(pod))
+	rsc.queue.Add(rsKey)
+}
+```
+
+AddRS/DeleteRS/UpdateRS
+
+```
+func (rsc *ReplicaSetController) addRS(obj interface{}) {
+	rs := obj.(*apps.ReplicaSet)
+	klog.V(4).Infof("Adding %s %s/%s", rsc.Kind, rs.Namespace, rs.Name)
+	rsc.enqueueRS(rs)
+}
+```
+
+```
+// callback when RS is updated
+func (rsc *ReplicaSetController) updateRS(old, cur interface{}) {
+	oldRS := old.(*apps.ReplicaSet)
+	curRS := cur.(*apps.ReplicaSet)
+
+	// TODO: make a KEP and fix informers to always call the delete event handler on re-create
+	if curRS.UID != oldRS.UID {
+		key, err := controller.KeyFunc(oldRS)
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", oldRS, err))
+			return
+		}
+		rsc.deleteRS(cache.DeletedFinalStateUnknown{
+			Key: key,
+			Obj: oldRS,
+		})
+	}
+
+	// You might imagine that we only really need to enqueue the
+	// replica set when Spec changes, but it is safer to sync any
+	// time this function is triggered. That way a full informer
+	// resync can requeue any replica set that don't yet have pods
+	// but whose last attempts at creating a pod have failed (since
+	// we don't block on creation of pods) instead of those
+	// replica sets stalling indefinitely. Enqueueing every time
+	// does result in some spurious syncs (like when Status.Replica
+	// is updated and the watch notification from it retriggers
+	// this function), but in general extra resyncs shouldn't be
+	// that bad as ReplicaSets that haven't met expectations yet won't
+	// sync, and all the listing is done using local stores.
+	if *(oldRS.Spec.Replicas) != *(curRS.Spec.Replicas) {
+		klog.V(4).Infof("%v %v updated. Desired pod count change: %d->%d", rsc.Kind, curRS.Name, *(oldRS.Spec.Replicas), *(curRS.Spec.Replicas))
+	}
+	rsc.enqueueRS(curRS)
+}
+```
+
+```
+func (rsc *ReplicaSetController) deleteRS(obj interface{}) {
+	rs, ok := obj.(*apps.ReplicaSet)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("couldn't get object from tombstone %#v", obj))
+			return
+		}
+		rs, ok = tombstone.Obj.(*apps.ReplicaSet)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("tombstone contained object that is not a ReplicaSet %#v", obj))
+			return
+		}
+	}
+
+	key, err := controller.KeyFunc(rs)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", rs, err))
+		return
+	}
+
+	klog.V(4).Infof("Deleting %s %q", rsc.Kind, key)
+
+	// Delete expectations for the ReplicaSet so if we create a new one with the same name it starts clean
+	rsc.expectations.DeleteExpectations(key)
+
+	rsc.queue.Add(key)
+}
+```
+
+#### expectations 机制
+
+通过上面的分析可知，在 rs 每次入队后进行 sync 操作时，首先需要判断该 rs 是否满足 expectations 机制，那么这个 expectations 的目的是什么？其实，rs 除了有 informer 的缓存外，还有一个本地缓存就是 expectations，expectations 会记录 rs 所有对象需要 add/del 的 pod 数量，若两者都为 0 则说明该 rs 所期望创建的 pod 或者删除的 pod 数已经被满足，若不满足则说明某次在 syncLoop 中创建或者删除 pod 时有失败的操作，则需要等待 expectations 过期后再次同步该 rs。
+
+通过上面对 eventHandler 的分析，再来总结一下触发 replicaSet 对象发生同步事件的条件：
+
+1、与 rs 相关的：AddRS、UpdateRS、DeleteRS；
+2、与 pod 相关的：AddPod、UpdatePod、DeletePod；
+3、informer 二级缓存的同步；
+但是所有的更新事件是否都需要执行 sync 操作？对于除 rs.Spec.Replicas 之外的更新操作其实都没必要执行 sync 操作，因为 spec 其他字段和 status 的更新都不需要创建或者删除 pod。
+
+在 sync 操作真正开始之前，依据 expectations 机制进行判断，确定是否要真正地启动一次 sync，因为在 eventHandler 阶段也会更新 expectations 值，从上面的 eventHandler 中可以看到在 addPod 中会调用 rsc.expectations.CreationObserved 更新 rsKey 的 expectations，将其 add 值 -1，在 deletePod 中调用 rsc.expectations.DeletionObserved 将其 del 值 -1。所以等到 sync 时，若 controllerKey(name 或者 ns/name)满足 expectations 机制则进行 sync 操作，而 updatePod 并不会修改 expectations，所以，expectations 的设计就是当需要创建或删除 pod 才会触发对应的 sync 操作，expectations 机制的目的就是减少不必要的 sync 操作。
+
+什么条件下 expectations 机制会满足？
+
+1、当 expectations 中不存在 rsKey 时，也就说首次创建 rs 时；
+2、当 expectations 中 del 以及 add 值都为 0 时，即 rs 所需要创建或者删除的 pod 数都已满足；
+3、当 expectations 过期时，即超过 5 分钟未进行 sync 操作；
+最后再看一下 expectations 中用到的几个方法：
+
+```
+// ControllerExpectationsInterface is an interface that allows users to set and wait on expectations.
+// Only abstracted out for testing.
+// Warning: if using KeyFunc it is not safe to use a single ControllerExpectationsInterface with different
+// types of controllers, because the keys might conflict across types.
+type ControllerExpectationsInterface interface {
+	GetExpectations(controllerKey string) (*ControlleeExpectations, bool, error)
+	SatisfiedExpectations(controllerKey string) bool
+	DeleteExpectations(controllerKey string)
+	SetExpectations(controllerKey string, add, del int) error
+	ExpectCreations(controllerKey string, adds int) error
+	ExpectDeletions(controllerKey string, dels int) error
+	CreationObserved(controllerKey string)
+	DeletionObserved(controllerKey string)
+	RaiseExpectations(controllerKey string, add, del int)
+	LowerExpectations(controllerKey string, add, del int)
+}
+```
+
+### syncReplicaSet
+
+syncReplicaSet 是 controller 的核心方法，它会驱动 controller 所控制的对象达到期望状态，主要逻辑如下所示：
+
+1、根据 ns/name 获取 rs 对象；
+2、调用 expectations.SatisfiedExpectations 判断是否需要执行真正的 sync 操作；
+3、获取所有 pod list；
+4、根据 pod label 进行过滤获取与该 rs 关联的 pod 列表，对于其中的孤儿 pod 若与该 rs label 匹配则进行关联，若已关联的 pod 与 rs label 不匹配则解除关联关系；
+5、调用 manageReplicas 进行同步 pod 操作，add/del pod；
+6、计算 rs 当前的 status 并进行更新；
+7、若 rs 设置了 MinReadySeconds 字段则将该 rs 加入到延迟队列中；
+
+```
+// syncReplicaSet will sync the ReplicaSet with the given key if it has had its expectations fulfilled,
+// meaning it did not expect to see any more of its pods created or deleted. This function is not meant to be
+// invoked concurrently with the same key.
+func (rsc *ReplicaSetController) syncReplicaSet(key string) error {
+	startTime := time.Now()
+	defer func() {
+		klog.V(4).Infof("Finished syncing %v %q (%v)", rsc.Kind, key, time.Since(startTime))
+	}()
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return err
+	}
+	rs, err := rsc.rsLister.ReplicaSets(namespace).Get(name)
+	if errors.IsNotFound(err) {
+		klog.V(4).Infof("%v %v has been deleted", rsc.Kind, key)
+		rsc.expectations.DeleteExpectations(key)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	rsNeedsSync := rsc.expectations.SatisfiedExpectations(key)
+	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("error converting pod selector to selector: %v", err))
+		return nil
+	}
+
+	// list all pods to include the pods that don't match the rs`s selector
+	// anymore but has the stale controller ref.
+	// TODO: Do the List and Filter in a single pass, or use an index.
+	allPods, err := rsc.podLister.Pods(rs.Namespace).List(labels.Everything())
+	if err != nil {
+		return err
+	}
+	// Ignore inactive pods.
+	filteredPods := controller.FilterActivePods(allPods)
+
+	// NOTE: filteredPods are pointing to objects from cache - if you need to
+	// modify them, you need to copy it first.
+	filteredPods, err = rsc.claimPods(rs, selector, filteredPods)
+	if err != nil {
+		return err
+	}
+
+	var manageReplicasErr error
+	if rsNeedsSync && rs.DeletionTimestamp == nil {
+		manageReplicasErr = rsc.manageReplicas(filteredPods, rs)
+	}
+	rs = rs.DeepCopy()
+	newStatus := calculateStatus(rs, filteredPods, manageReplicasErr)
+
+	// Always updates status as pods come up or die.
+	updatedRS, err := updateReplicaSetStatus(rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace), rs, newStatus)
+	if err != nil {
+		// Multiple things could lead to this update failing. Requeuing the replica set ensures
+		// Returning an error causes a requeue without forcing a hotloop
+		return err
+	}
+	// Resync the ReplicaSet after MinReadySeconds as a last line of defense to guard against clock-skew.
+	if manageReplicasErr == nil && updatedRS.Spec.MinReadySeconds > 0 &&
+		updatedRS.Status.ReadyReplicas == *(updatedRS.Spec.Replicas) &&
+		updatedRS.Status.AvailableReplicas != *(updatedRS.Spec.Replicas) {
+		rsc.queue.AddAfter(key, time.Duration(updatedRS.Spec.MinReadySeconds)*time.Second)
+	}
+	return manageReplicasErr
+}
+
+```
+
+#### manageReplicas
 
 manageReplicas 是最核心的方法，它会计算 replicaSet 需要创建或者删除多少个 pod 并调用 apiserver 的接口进行操作，在此阶段仅仅是调用 apiserver 的接口进行创建，并不保证 pod 成功运行，如果在某一轮，未能成功创建的所有 Pod 对象，则不再创建剩余的 pod。一个周期内最多只能创建或删除 500 个 pod，若超过上限值未创建完成的 pod 数会在下一个 syncLoop 继续进行处理。
 
@@ -383,5 +757,98 @@ func getPodsRankedByRelatedPodsOnSameNode(podsToRank, relatedPods []*v1.Pod) con
 		ranks[i] = podsOnNode[pod.Spec.NodeName]
 	}
 	return controller.ActivePodsWithRanks{Pods: podsToRank, Rank: ranks}
+}
+```
+
+```
+// ActivePodsWithRanks is a sortable list of pods and a list of corresponding
+// ranks which will be considered during sorting.  The two lists must have equal
+// length.  After sorting, the pods will be ordered as follows, applying each
+// rule in turn until one matches:
+//
+// 1. If only one of the pods is assigned to a node, the pod that is not
+//    assigned comes before the pod that is.
+// 2. If the pods' phases differ, a pending pod comes before a pod whose phase
+//    is unknown, and a pod whose phase is unknown comes before a running pod.
+// 3. If exactly one of the pods is ready, the pod that is not ready comes
+//    before the ready pod.
+// 4. If the pods' ranks differ, the pod with greater rank comes before the pod
+//    with lower rank.
+// 5. If both pods are ready but have not been ready for the same amount of
+//    time, the pod that has been ready for a shorter amount of time comes
+//    before the pod that has been ready for longer.
+// 6. If one pod has a container that has restarted more than any container in
+//    the other pod, the pod with the container with more restarts comes
+//    before the other pod.
+// 7. If the pods' creation times differ, the pod that was created more recently
+//    comes before the older pod.
+//
+// If none of these rules matches, the second pod comes before the first pod.
+//
+// The intention of this ordering is to put pods that should be preferred for
+// deletion first in the list.
+type ActivePodsWithRanks struct {
+	// Pods is a list of pods.
+	Pods []*v1.Pod
+
+	// Rank is a ranking of pods.  This ranking is used during sorting when
+	// comparing two pods that are both scheduled, in the same phase, and
+	// having the same ready status.
+	Rank []int
+}
+
+func (s ActivePodsWithRanks) Len() int {
+	return len(s.Pods)
+}
+
+func (s ActivePodsWithRanks) Swap(i, j int) {
+	s.Pods[i], s.Pods[j] = s.Pods[j], s.Pods[i]
+	s.Rank[i], s.Rank[j] = s.Rank[j], s.Rank[i]
+}
+
+// Less compares two pods with corresponding ranks and returns true if the first
+// one should be preferred for deletion.
+func (s ActivePodsWithRanks) Less(i, j int) bool {
+	// 1. Unassigned < assigned
+	// If only one of the pods is unassigned, the unassigned one is smaller
+	if s.Pods[i].Spec.NodeName != s.Pods[j].Spec.NodeName && (len(s.Pods[i].Spec.NodeName) == 0 || len(s.Pods[j].Spec.NodeName) == 0) {
+		return len(s.Pods[i].Spec.NodeName) == 0
+	}
+	// 2. PodPending < PodUnknown < PodRunning
+	if podPhaseToOrdinal[s.Pods[i].Status.Phase] != podPhaseToOrdinal[s.Pods[j].Status.Phase] {
+		return podPhaseToOrdinal[s.Pods[i].Status.Phase] < podPhaseToOrdinal[s.Pods[j].Status.Phase]
+	}
+	// 3. Not ready < ready
+	// If only one of the pods is not ready, the not ready one is smaller
+	if podutil.IsPodReady(s.Pods[i]) != podutil.IsPodReady(s.Pods[j]) {
+		return !podutil.IsPodReady(s.Pods[i])
+	}
+	// 4. Doubled up < not doubled up
+	// If one of the two pods is on the same node as one or more additional
+	// ready pods that belong to the same replicaset, whichever pod has more
+	// colocated ready pods is less
+	if s.Rank[i] != s.Rank[j] {
+		return s.Rank[i] > s.Rank[j]
+	}
+	// TODO: take availability into account when we push minReadySeconds information from deployment into pods,
+	//       see https://github.com/kubernetes/kubernetes/issues/22065
+	// 5. Been ready for empty time < less time < more time
+	// If both pods are ready, the latest ready one is smaller
+	if podutil.IsPodReady(s.Pods[i]) && podutil.IsPodReady(s.Pods[j]) {
+		readyTime1 := podReadyTime(s.Pods[i])
+		readyTime2 := podReadyTime(s.Pods[j])
+		if !readyTime1.Equal(readyTime2) {
+			return afterOrZero(readyTime1, readyTime2)
+		}
+	}
+	// 6. Pods with containers with higher restart counts < lower restart counts
+	if maxContainerRestarts(s.Pods[i]) != maxContainerRestarts(s.Pods[j]) {
+		return maxContainerRestarts(s.Pods[i]) > maxContainerRestarts(s.Pods[j])
+	}
+	// 7. Empty creation time pods < newer pods < older pods
+	if !s.Pods[i].CreationTimestamp.Equal(&s.Pods[j].CreationTimestamp) {
+		return afterOrZero(&s.Pods[i].CreationTimestamp, &s.Pods[j].CreationTimestamp)
+	}
+	return false
 }
 ```
