@@ -754,3 +754,53 @@ type EventRecorder interface {
 	AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{})
 }
 ```
+
+```
+// Run begins watching and syncing.
+func (a *HorizontalController) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	defer a.queue.ShutDown()
+
+	klog.Infof("Starting HPA controller")
+	defer klog.Infof("Shutting down HPA controller")
+
+	if !cache.WaitForNamedCacheSync("HPA", stopCh, a.hpaListerSynced, a.podListerSynced) {
+		return
+	}
+
+	// start a single worker (we may wish to start more in the future)
+	go wait.Until(a.worker, time.Second, stopCh)
+
+	<-stopCh
+}
+
+// obj could be an *v1.HorizontalPodAutoscaler, or a DeletionFinalStateUnknown marker item.
+func (a *HorizontalController) updateHPA(old, cur interface{}) {
+	a.enqueueHPA(cur)
+}
+
+// obj could be an *v1.HorizontalPodAutoscaler, or a DeletionFinalStateUnknown marker item.
+func (a *HorizontalController) enqueueHPA(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
+		return
+	}
+
+	// Requests are always added to queue with resyncPeriod delay.  If there's already
+	// request for the HPA in the queue then a new request is always dropped. Requests spend resync
+	// interval in queue so HPAs are processed every resync interval.
+	a.queue.AddRateLimited(key)
+}
+
+func (a *HorizontalController) deleteHPA(obj interface{}) {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
+		return
+	}
+
+	// TODO: could we leak if we fail to get the key?
+	a.queue.Forget(key)
+}
+```
