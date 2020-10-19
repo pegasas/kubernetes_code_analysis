@@ -22,7 +22,7 @@ func startReplicationController(ctx ControllerContext) (http.Handler, bool, erro
 }
 ```
 
-调用了NewReplicationManager
+diaoyong了NewReplicationManager
 
 ```
 // NewReplicationManager configures a replication manager with the specified event recorder
